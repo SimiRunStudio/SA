@@ -1,0 +1,264 @@
+name: SA Calculator Android Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK and AAB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Find Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          SDKMANAGER=""
+
+          for candidate in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager"; do
+            if [[ -x "$candidate" ]]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(
+              find "$SDK_ROOT/cmdline-tools" \
+                -type f \
+                -name sdkmanager \
+                -perm -111 \
+                2>/dev/null |
+              sort -V |
+              tail -1 || true
+            )"
+          fi
+
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager not found"
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          echo "Using:"
+          echo "$SDKMANAGER"
+          "$SDKMANAGER" --version
+
+      - name: Accept Android licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | "$ANDROID_SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --licenses >/dev/null || true
+
+      - name: Install Android SDK tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "$ANDROID_SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "cmake;3.22.1" \
+            "ndk;28.2.13676358"
+
+      - name: Prepare Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/build-source"
+          mkdir -p "$GITHUB_WORKSPACE/build-source"
+
+          shopt -s nullglob
+
+          ZIP_FILES=(
+            "$GITHUB_WORKSPACE"/*.zip
+            "$GITHUB_WORKSPACE"/*.ZIP
+          )
+
+          if (( ${#ZIP_FILES[@]} > 0 )); then
+            echo "ZIP project detected:"
+            printf '%s\n' "${ZIP_FILES[@]}"
+
+            unzip -q "${ZIP_FILES[0]}" -d "$GITHUB_WORKSPACE/build-source"
+          else
+            echo "No ZIP found. Using repository files directly."
+
+            rsync -a \
+              --exclude='.git' \
+              --exclude='build-source' \
+              "$GITHUB_WORKSPACE/" \
+              "$GITHUB_WORKSPACE/build-source/"
+          fi
+
+          PROJECT_ROOT=""
+
+          while IFS= read -r settings_file; do
+            candidate="$(dirname "$settings_file")"
+
+            if [[ -f "$candidate/app/build.gradle" || \
+                  -f "$candidate/app/build.gradle.kts" ]]; then
+              PROJECT_ROOT="$candidate"
+              break
+            fi
+          done < <(
+            find "$GITHUB_WORKSPACE/build-source" \
+              -type f \
+              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+              -print
+          )
+
+          if [[ -z "$PROJECT_ROOT" ]]; then
+            echo "ERROR: Android Gradle project not found."
+            find "$GITHUB_WORKSPACE/build-source" \
+              -maxdepth 5 \
+              -type f \
+              | sort \
+              | head -300
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "Android project:"
+          echo "$PROJECT_ROOT"
+
+          test -f "$PROJECT_ROOT/settings.gradle" \
+            -o -f "$PROJECT_ROOT/settings.gradle.kts"
+
+          test -f "$PROJECT_ROOT/app/build.gradle" \
+            -o -f "$PROJECT_ROOT/app/build.gradle.kts"
+
+          test -f "$PROJECT_ROOT/app/src/main/AndroidManifest.xml"
+
+          test -f "$PROJECT_ROOT/app/src/main/cpp/CMakeLists.txt"
+
+      - name: Validate native project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          test -f app/src/main/cpp/native_bridge.cpp
+          test -f app/src/main/cpp/sa_calculator.cpp
+          test -f app/src/main/cpp/sa_calculator.hpp
+
+          if grep -Rqs \
+            "android-actions/setup-android@v3" \
+            .github/workflows 2>/dev/null; then
+            echo "ERROR: obsolete setup-android workflow detected"
+            exit 1
+          fi
+
+          echo "Native Android project validation: PASS"
+
+      - name: Set up Gradle 9.5.0
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.0'
+          cache-read-only: false
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Build Release APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Build Release AAB
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          gradle --no-daemon --stacktrace :app:bundleRelease
+
+      - name: Verify APK and AAB
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG_APK="$PROJECT_ROOT/app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_APK="$PROJECT_ROOT/app/build/outputs/apk/release/app-release-unsigned.apk"
+          RELEASE_AAB="$PROJECT_ROOT/app/build/outputs/bundle/release/app-release.aab"
+
+          test -s "$DEBUG_APK"
+          test -s "$RELEASE_APK"
+          test -s "$RELEASE_AAB"
+
+          echo "===================================="
+          echo "BUILD OUTPUTS"
+          echo "===================================="
+
+          ls -lh "$DEBUG_APK"
+          ls -lh "$RELEASE_APK"
+          ls -lh "$RELEASE_AAB"
+
+          echo "===================================="
+          echo "SHA256"
+          echo "===================================="
+
+          sha256sum \
+            "$DEBUG_APK" \
+            "$RELEASE_APK" \
+            "$RELEASE_AAB"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-debug-apk
+          if-no-files-found: error
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-release-unsigned-apk
+          if-no-files-found: error
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/release/app-release-unsigned.apk
+          retention-days: 30
+
+      - name: Upload Release AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-release-aab
+          if-no-files-found: error
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
